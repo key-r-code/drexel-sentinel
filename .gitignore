@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Sentinel specific files
+.env
+data/
+*.db
+service_account.json
