@@ -12,5 +12,6 @@ wheels/
 # Sentinel specific files
 .env
 data/
+db/
 *.db
 service_account.json
