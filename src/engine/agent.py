@@ -1,169 +1,161 @@
 import os
-import sqlite3
-import datetime
-import logging
+import warnings
+from typing import Literal
+from datetime import datetime
 from dotenv import load_dotenv
-from langchain_core.tools import tool
-from langchain_chroma import Chroma
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_tavily import TavilySearch
-from googleapiclient.discovery import build
 from google.oauth2 import service_account
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.tools import tool
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
+from src.engine.tools import web_search, search_syllabi, add_to_calendar, delete_event
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 load_dotenv()
 
-# --- LOGGING SETUP ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
+# --- 1. SETUP ---
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "drexel-sentinel")
+creds = service_account.Credentials.from_service_account_file(
+    os.path.abspath("service_account.json")
+).with_scopes(['https://www.googleapis.com/auth/cloud-platform'])
+
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", credentials=creds, project=PROJECT_ID)
+
+# --- 2. SPECIALIST AGENTS ---
+
+advising_prompt = f"""You are an academic advisor. Use the search_syllabi tool to search through course documents for grading and policies. Be precise.
+
+IMPORTANT: Today's date is {datetime.now().strftime('%B %d, %Y')} (YYYY-MM-DD: {datetime.now().strftime('%Y-%m-%d')}). Use this for any date calculations."""
+
+calendar_agent_prompt = f"""
+You are a high-level calendar assistant. 
+
+CURRENT DATE: Today is {datetime.now().strftime('%B %d, %Y')} (YYYY-MM-DD: {datetime.now().strftime('%Y-%m-%d')}).
+
+CRITICAL: When calling add_to_calendar tool:
+- If time is unknown/TBD, pass an EMPTY STRING "" for time_str (NOT "TBD", NOT "None")
+- If location is unknown/TBD, pass an EMPTY STRING "" for location (NOT "TBD", NOT "None")  
+- If description/room is unknown/TBD, pass an EMPTY STRING "" for description (NOT "TBD", NOT "None")
+- ALWAYS call the tool even if some fields are unknown - just use empty strings for those fields
+- If users wants to modify an event, use the delete_event tool to delete the event first and then use the add_to_calendar tool to add the new event.
+
+FORMATTING & ROOMS:
+1. Event Title MUST be: '[COURSE]: [TYPE]' (e.g., 'MATH 291: Exam 1').
+2. Put the room number (e.g., 'Bossone 201') into the 'description' field of the tool.
+3. Use the formal building name (e.g., 'Bossone Research Enterprise Center') for the 'location' field.
+
+DATE FORMATS:
+- CRITICAL: When the user mentions dates like "February 4th" or "week 5", calculate the correct YEAR based on today's date ({datetime.now().strftime('%Y-%m-%d')}).
+- Always use YYYY-MM-DD format for date_str parameter.
+- If a date has already passed this academic year, it likely refers to next year.
+"""
+
+research_agent_prompt = f"""You are a researcher. Use the web_search tool to search for Drexel faculty news, research papers, and professor bios. You can also use the tool to look up general information asked.
+
+IMPORTANT: Today's date is {datetime.now().strftime('%B %d, %Y')} (YYYY-MM-DD: {datetime.now().strftime('%Y-%m-%d')}). Use this for any date-related queries."""
+
+memory = MemorySaver()
+
+advising_agent = create_react_agent(
+    model=llm, 
+    tools=[search_syllabi], 
+    checkpointer=memory, 
+    prompt=advising_prompt
 )
-logger = logging.getLogger(__name__)
 
-# --- CONFIG ---
-CRED_PATH = os.path.abspath("service_account.json")
-CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-TIMEZONE = "America/New_York"
+calendar_agent = create_react_agent(
+    model=llm, 
+    tools=[add_to_calendar, delete_event], 
+    checkpointer=memory,  
+    prompt=calendar_agent_prompt
+)
 
-logger.info(f"Calendar ID configured: {CALENDAR_ID}")
+research_agent = create_react_agent(
+    model=llm, 
+    tools=[web_search], 
+    checkpointer=memory,  
+    prompt=research_agent_prompt
+)
 
-# --- AUTH ---
-SCOPES = ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/calendar']
-creds = service_account.Credentials.from_service_account_file(CRED_PATH).with_scopes(SCOPES)
-calendar_service = build('calendar', 'v3', credentials=creds)
+# --- 3. Wrapper tools for the agents ---
+# Store the base thread_id to create sub-agent thread IDs
+_current_thread_id = None
 
-# --- WEB SEARCH TOOL ---
-web_search = TavilySearch(max_results=3)
+def set_thread_id(thread_id: str):
+    """Helper to set the current thread ID for sub-agents"""
+    global _current_thread_id
+    _current_thread_id = thread_id
 
-# --- EXISTING TOOLS ---
-embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", credentials=creds)
-vector_db = Chroma(persist_directory="db", embedding_function=embeddings)
-
-@tool
-def search_syllabi(query: str):
-    """Search course syllabuses for academic policies, grading, and office hours."""
-    logger.info(f"search_syllabi called with query: {query}")
-    docs = vector_db.similarity_search(query, k=3)
-    result = "\n\n".join([d.page_content for d in docs])
-    logger.info(f"search_syllabi returned {len(docs)} documents")
-    return result
-
-@tool
-def add_to_calendar(title: str, date_str: str, time_str: str = "", location: str = "", description: str = ""):
+@tool 
+def calendar_assistant(request: str):
+    """Add or remove calendar events. Use this tool when the user asks to add, remove, or modify calendar events.
+    
+    Input: Natural language scheduling request 
     """
-    Adds a detailed event to the Google Calendar.
-    - title: [COURSE]: [TYPE] format (e.g., MATH 291: Exam 1)
-    - date_str: YYYY-MM-DD
-    - time_str: HH:MM (24-hour format). Leave empty string if time is unknown or TBD.
-    - location: Building name. Leave empty string if unknown or TBD.
-    - description: Room number or additional notes. Leave empty string if unknown or TBD.
-    """
-    
-    logger.info("="*60)
-    logger.info("ADD_TO_CALENDAR FUNCTION CALLED")
-    logger.info(f"Title: {title}")
-    logger.info(f"Date: {date_str}")
-    logger.info(f"Time: {time_str}")
-    logger.info(f"Location: {location}")
-    logger.info(f"Description: {description}")
-    logger.info(f"Calendar ID: {CALENDAR_ID}")
-    logger.info("="*60)
-    
-    # Graphite (Color ID 8) for exams
-    color_id = "8" if any(kw in title.lower() for kw in ["exam", "midterm", "quiz"]) else None
-    
-    # Check if time is provided and valid (not empty, not "TBD", not "None")
-    is_timed = (
-        time_str 
-        and time_str.strip() 
-        and time_str.upper() not in ["TBD", "NONE", "UNKNOWN", "N/A"]
-    )
-    
-    event = None  # Initialize event
-    
-    if is_timed:
-        try:
-            start_time = f"{date_str}T{time_str}:00"
-            start_obj = datetime.datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%S")
-            end_time = (start_obj + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
-            
-            event = {
-                'summary': title,
-                'location': location if location and location.upper() not in ["TBD", "NONE", "UNKNOWN"] else None,
-                'description': description if description and description.upper() not in ["TBD", "NONE", "UNKNOWN"] else None,
-                'colorId': color_id,
-                'start': {'dateTime': start_time, 'timeZone': TIMEZONE},
-                'end': {'dateTime': end_time, 'timeZone': TIMEZONE},
-            }
-            logger.info(f"Created timed event object")
-        except ValueError as e:
-            # If time parsing fails, fall through to create all-day event
-            logger.warning(f"Time parsing failed: {e}, creating all-day event instead")
-            event = None
-            
-    # Create all-day event if not timed or if timed parsing failed
-    if event is None:
-        event = {
-            'summary': title,
-            'location': location if location and location.strip() and location.upper() not in ["TBD", "NONE", "UNKNOWN"] else None,
-            'description': description if description and description.strip() and description.upper() not in ["TBD", "NONE", "UNKNOWN"] else None,
-            'colorId': color_id,
-            'start': {'date': date_str},
-            'end': {'date': date_str},
-        }
-        logger.info(f"Created all-day event object")
-
-    logger.info(f"Event object: {event}")
-    
-    try:
-        result = calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        logger.info(f"Google API Response: {result}")
-        logger.info(f"Event created successfully with ID: {result.get('id')}")
-        return f"Successfully added '{title}' for {date_str} (Room: {description or 'N/A'})."
-    except Exception as e:
-        logger.error(f"ERROR adding event: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return f"Error adding event: {str(e)}"
+    # Use a separate thread ID for the calendar agent to avoid message history conflicts
+    sub_thread_id = f"{_current_thread_id}_calendar" if _current_thread_id else "calendar"
+    config = {"configurable": {"thread_id": sub_thread_id}}
+    result = calendar_agent.invoke({"messages": [("user", request)]}, config=config)
+    return result["messages"][-1].content
 
 @tool
-def delete_event(event_title: str, date_str: str):
-    """Deletes an event from the calendar."""
-    logger.info("="*60)
-    logger.info("DELETE_EVENT FUNCTION CALLED")
-    logger.info(f"Event title: {event_title}")
-    logger.info(f"Date: {date_str}")
-    logger.info(f"Calendar ID: {CALENDAR_ID}")
-    logger.info("="*60)
+def research_assistant(request: str):
+    """Search the web for information. This tool is a wrapper for the web_search tool. Use this tool when the user asks to search the web for information.
     
-    try:
-        t_min, t_max = f"{date_str}T00:00:00Z", f"{date_str}T23:59:59Z"
-        events = calendar_service.events().list(
-            calendarId=CALENDAR_ID, 
-            timeMin=t_min, 
-            timeMax=t_max, 
-            q=event_title
-        ).execute().get('items', [])
-        
-        logger.info(f"Found {len(events)} matching event(s)")
-        for event in events:
-            logger.info(f"  - {event.get('summary')} (ID: {event.get('id')})")
-        
-        if not events:
-            logger.warning(f"No events found matching '{event_title}' on {date_str}")
-            return f"No events found matching '{event_title}' on {date_str}."
-        
-        for event in events:
-            calendar_service.events().delete(calendarId=CALENDAR_ID, eventId=event['id']).execute()
-            logger.info(f"Deleted event: {event.get('summary')} (ID: {event.get('id')})")
-        
-        return f"Removed {len(events)} event(s) matching '{event_title}' from {date_str}."
-    except Exception as e:
-        logger.error(f"ERROR deleting event: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return f"Error deleting event: {str(e)}"
+    Input: Natural language search request (e.g., 'what is the weather in Philadelphia? or Tell me more about the professor of MATH 291')
+    """
+    # Use a separate thread ID for the research agent
+    sub_thread_id = f"{_current_thread_id}_research" if _current_thread_id else "research"
+    config = {"configurable": {"thread_id": sub_thread_id}}
+    result = research_agent.invoke({"messages": [("user", request)]}, config=config)
+    return result["messages"][-1].content
 
-tools = [search_syllabi, add_to_calendar, delete_event, web_search]
+@tool
+def advisor_assistant(request: str):
+    """Search the course documents for information. This tool is a wrapper for the search_syllabi tool. Use this tool when the user asks to search the course documents for information.
+    
+    Input: Natural language search request (e.g., 'what is the grading policy for MATH 291?')
+    """
+    # Use a separate thread ID for the advising agent
+    sub_thread_id = f"{_current_thread_id}_advisor" if _current_thread_id else "advisor"
+    config = {"configurable": {"thread_id": sub_thread_id}}
+    result = advising_agent.invoke({"messages": [("user", request)]}, config=config)
+    return result["messages"][-1].content
+
+# --- 4. Supervisor agent ---
+SUPERVISOR_PROMPT = f"""
+You are the Drexel Sentinel Executive Assistant. You are responsible for overseeing the work of the calendar_agent, research_agent, and advising_agent. You should also be able to answer general questions such as date and time, weather, and other general information.
+
+CURRENT DATE: Today is {datetime.now().strftime('%B %d, %Y')} (YYYY-MM-DD: {datetime.now().strftime('%Y-%m-%d')}).
+
+You will be given a user query and you will need to determine which agent to route the query to.
+You will also need to determine if the user query is a scheduling request, a research request, or an advising request.
+Infer the user's intent from the query and route the query to the appropriate agent. For example:
+- If the user asks to add an event to the calendar, route to calendar_agent.
+- If the user asks to search the web for information, route to research_agent.
+- If the user asks to search the course documents for information, route to advisor_agent.
+- If the user asks a general question, route to the appropriate agent based on the query.
+
+Example:
+User: "Add MATH 291 Exam 1 on Feb 4th"
+You: Route to calendar_agent
+
+User: "What is the weather in Philadelphia?"
+You: Route to research_agent
+
+User: "What is the grading policy for MATH 291?"
+You: Route to advisor_agent
+"""
+supervisor_agent = create_react_agent(
+    model=llm, 
+    tools=[calendar_assistant, research_assistant, advisor_assistant], 
+    checkpointer=memory,
+    prompt=SUPERVISOR_PROMPT
+)
+
+
+def ask_sentinel(user_input: str, thread_id: str):
+    config = {"configurable": {"thread_id": thread_id}}
+    set_thread_id(thread_id)
+    result = supervisor_agent.invoke({"messages": [("user", user_input)]}, config=config)
+    return result["messages"][-1].content
